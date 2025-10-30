@@ -343,6 +343,14 @@ wss.on('connection', (ws) => {
   });
 });
 
+// Serve static frontend files from public/
+app.use(express.static('public'));
+
+// Catch-all route to serve index.html for client-side routing
+app.get('*', (req, res) => {
+  res.sendFile('public/index.html', { root: '.' });
+});
+
 const port = process.env.PORT || 8888;
 httpServer.listen(port, () => {
   console.log(`TrustTrade backend listening on :${port}`);
