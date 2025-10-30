@@ -9,6 +9,8 @@ import rateLimit from "express-rate-limit";
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import { z } from "zod";
+import path from "path";
+import { fileURLToPath } from "url";
 import { getCandles as krakenCandles, placeOrder as krakenPlace, getCurrentPrice, getAccountBalance } from "./adapters/kraken.mjs";
 import { lastSmaSignal } from "./lib/indicators.mjs";
 import { positionSizeUSD, preTradeChecks } from "./lib/risk.mjs";
@@ -21,25 +23,106 @@ import {
   analyzeAndSignal,
   setCdnPricesEnabled,
   isCdnPricesEnabled,
-  restartAutomation
+  restartAutomation,
+  getTradingMode,
+  setTradingMode
 } from "./lib/automation.mjs";
+import { getAnalyticsSummary } from "./lib/analytics.mjs";
+import {
+  getRiskSummary,
+  getCircuitBreakerConfig,
+  updateCircuitBreakerConfig,
+  resetCircuitBreaker,
+  getPortfolioLimits,
+  updatePortfolioLimits,
+  checkCircuitBreaker,
+  updateCircuitBreaker
+} from "./lib/advanced-risk.mjs";
+import {
+  runBacktest,
+  compareStrategies,
+  quickBacktest,
+  getAvailableStrategies,
+  validateBacktestConfig
+} from "./lib/backtesting.mjs";
+import {
+  sendNotification,
+  getAllNotifications,
+  getUnreadNotifications,
+  markAsRead,
+  markAllAsRead,
+  clearAllNotifications,
+  getNotificationPreferences,
+  updateNotificationPreferences,
+  sendTestNotification,
+  sendDailySummary,
+  getNotificationTypes
+} from "./lib/notifications.mjs";
 import { verifyWorldID } from "./lib/worldcoin.mjs";
 import fs from "fs";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+// Trust proxy (required for Render behind reverse proxy)
+app.set('trust proxy', 1);
 
 app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 app.use(morgan(process.env.NODE_ENV==="production" ? "combined" : "dev"));
 
+// Serve static frontend files
+app.use(express.static(path.join(__dirname, 'public')));
+
 // Initialize database
 initDatabase();
 
+// Auto-restart automation if it was running before server restart
+async function autoRestartAutomation() {
+  try {
+    const { getAutomationState } = await import('./lib/database.mjs');
+    const wasActive = await getAutomationState('automation_active');
+    const config = await getAutomationState('automation_config');
+
+    if (wasActive && config) {
+      console.log('🔄 Auto-restarting automation from previous session...');
+      console.log(`   Symbols: ${config.symbols?.join(', ') || 'BTCUSDT'}`);
+      console.log(`   Interval: ${config.interval || '1m'}`);
+
+      // Wait 5 seconds for everything to initialize
+      setTimeout(() => {
+        const result = startAutomation(config);
+        if (result.ok) {
+          console.log('✅ Automation auto-restarted successfully!');
+          console.log('   Your bot is now running 24/7 on Render');
+          console.log('   Close your laptop - it will keep trading!\n');
+        } else {
+          console.error('❌ Failed to auto-restart automation:', result.error);
+        }
+      }, 5000);
+    } else {
+      console.log('ℹ️  Automation was not active before restart. Waiting for manual start.');
+    }
+  } catch (err) {
+    console.error('Error checking automation state:', err.message);
+  }
+}
+
+// Call auto-restart after database initializes
+autoRestartAutomation();
+
 // Simple file logger for audit trail
 function audit(event, data){
-  fs.appendFileSync("./logs/audit.log", JSON.stringify({ts:Date.now(), event, ...data})+"\n");
+  try {
+    if (!fs.existsSync("./logs")) {
+      fs.mkdirSync("./logs", { recursive: true });
+    }
+    fs.appendFileSync("./logs/audit.log", JSON.stringify({ts:Date.now(), event, ...data})+"\n");
+  } catch (e) {
+    console.warn("Failed to write audit log:", e.message);
+  }
 }
 
 const limiter = rateLimit({ windowMs: 30_000, max: 60 });
@@ -48,6 +131,7 @@ app.use(limiter);
 app.get("/health", (_req, res) => res.json({
   ok:true,
   env: process.env.NODE_ENV || "dev",
+  version: "v2.1",
   automation: getAutomationStatus(),
   cdnPrices: isCdnPricesEnabled()
 }));
@@ -189,6 +273,35 @@ app.post("/automation/cdn-prices", (req, res) => {
   res.json({ ok: true, cdnPrices: isCdnPricesEnabled() });
 });
 
+// Trading Mode (Paper vs Live)
+app.get("/automation/mode", (req, res) => {
+  res.json({ ok: true, mode: getTradingMode() });
+});
+
+app.post("/automation/mode", (req, res) => {
+  try {
+    const { mode } = req.body || {};
+
+    if (!mode || (mode !== 'paper' && mode !== 'live')) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Trading mode must be "paper" or "live"'
+      });
+    }
+
+    setTradingMode(mode);
+    audit("trading_mode_changed", { mode });
+
+    res.json({
+      ok: true,
+      mode: getTradingMode(),
+      message: `Trading mode set to ${mode.toUpperCase()}`
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 // Portfolio & Dashboard
 app.get("/portfolio", async (req, res) => {
   try {
@@ -242,6 +355,272 @@ app.get("/trades", (req, res) => {
   res.json({ trades, count: trades.length });
 });
 
+// Performance Analytics
+app.get("/analytics", async (req, res) => {
+  try {
+    const {
+      startDate,
+      endDate,
+      symbol,
+      strategy,
+      initialCapital
+    } = req.query;
+
+    const options = {};
+    if (startDate) options.startDate = parseInt(startDate);
+    if (endDate) options.endDate = parseInt(endDate);
+    if (symbol) options.symbol = symbol;
+    if (strategy) options.strategy = strategy;
+    if (initialCapital) options.initialCapital = parseFloat(initialCapital);
+
+    const analytics = await getAnalyticsSummary(options);
+    audit("analytics_fetched", { filters: options });
+    res.json({ ok: true, ...analytics });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Risk Management - Get comprehensive risk summary
+app.get("/risk/summary", async (req, res) => {
+  try {
+    const portfolioValue = req.query.portfolioValue
+      ? parseFloat(req.query.portfolioValue)
+      : await getPortfolioValue();
+
+    const openTrades = getAllTrades().filter(t => t.status === 'open');
+
+    const riskSummary = await getRiskSummary(openTrades, portfolioValue);
+    audit("risk_summary_fetched", { portfolioValue });
+    res.json({ ok: true, ...riskSummary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Circuit Breaker - Get configuration
+app.get("/risk/circuit-breaker", (req, res) => {
+  try {
+    const config = getCircuitBreakerConfig();
+    res.json({ ok: true, ...config });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Circuit Breaker - Update configuration
+app.post("/risk/circuit-breaker/config", (req, res) => {
+  try {
+    const { maxConsecutiveLosses, cooldownMinutes } = req.body;
+    const config = updateCircuitBreakerConfig({ maxConsecutiveLosses, cooldownMinutes });
+    audit("circuit_breaker_config_updated", config);
+    res.json({ ok: true, ...config });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Circuit Breaker - Manual reset
+app.post("/risk/circuit-breaker/reset", (req, res) => {
+  try {
+    const result = resetCircuitBreaker();
+    audit("circuit_breaker_reset", {});
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Portfolio Limits - Get configuration
+app.get("/risk/limits", (req, res) => {
+  try {
+    const limits = getPortfolioLimits();
+    res.json({ ok: true, limits });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Portfolio Limits - Update configuration
+app.post("/risk/limits", (req, res) => {
+  try {
+    const limits = updatePortfolioLimits(req.body);
+    audit("portfolio_limits_updated", limits);
+    res.json({ ok: true, limits });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Backtesting - Run backtest
+app.post("/backtest/run", async (req, res) => {
+  try {
+    const config = {
+      symbol: req.body.symbol || 'BTCUSD',
+      strategy: req.body.strategy || 'momentum',
+      startDate: req.body.startDate || Date.now() - (30 * 24 * 60 * 60 * 1000),
+      endDate: req.body.endDate || Date.now(),
+      initialCapital: req.body.initialCapital || 10000,
+      positionSize: req.body.positionSize || 1000,
+      feeRate: req.body.feeRate || 0.0026,
+      slippage: req.body.slippage || 0.001,
+      interval: req.body.interval || '1h'
+    };
+
+    // Validate config
+    const validation = validateBacktestConfig(config);
+    if (!validation.valid) {
+      return res.status(400).json({ ok: false, errors: validation.errors });
+    }
+
+    const result = await runBacktest(config);
+    audit("backtest_run", { strategy: config.strategy, trades: result.summary.totalTrades });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Backtest error:', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Backtesting - Compare strategies
+app.post("/backtest/compare", async (req, res) => {
+  try {
+    const config = {
+      symbol: req.body.symbol || 'BTCUSD',
+      startDate: req.body.startDate || Date.now() - (30 * 24 * 60 * 60 * 1000),
+      endDate: req.body.endDate || Date.now(),
+      initialCapital: req.body.initialCapital || 10000,
+      positionSize: req.body.positionSize || 1000,
+      feeRate: req.body.feeRate || 0.0026,
+      slippage: req.body.slippage || 0.001,
+      interval: req.body.interval || '1h'
+    };
+
+    const result = await compareStrategies(config);
+    audit("backtest_compare", { strategies: result.comparison.length });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Strategy comparison error:', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Backtesting - Quick backtest
+app.post("/backtest/quick", async (req, res) => {
+  try {
+    const { symbol = 'BTCUSD', strategy = 'momentum' } = req.body || {};
+    const result = await quickBacktest(symbol, strategy);
+    audit("backtest_quick", { symbol, strategy });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Quick backtest error:', e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Backtesting - Get available strategies
+app.get("/backtest/strategies", (req, res) => {
+  try {
+    const strategies = getAvailableStrategies();
+    res.json({ ok: true, strategies });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Get all notifications
+app.get("/notifications", (req, res) => {
+  try {
+    const limit = req.query.limit ? parseInt(req.query.limit) : 50;
+    const notifications = getAllNotifications(limit);
+    res.json({ ok: true, notifications, count: notifications.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Get unread notifications
+app.get("/notifications/unread", (req, res) => {
+  try {
+    const notifications = getUnreadNotifications();
+    res.json({ ok: true, notifications, count: notifications.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Mark as read
+app.post("/notifications/:id/read", (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const result = markAsRead(id);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Mark all as read
+app.post("/notifications/read-all", (req, res) => {
+  try {
+    const result = markAllAsRead();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Clear all
+app.post("/notifications/clear", (req, res) => {
+  try {
+    const result = clearAllNotifications();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Get preferences
+app.get("/notifications/preferences", (req, res) => {
+  try {
+    const preferences = getNotificationPreferences();
+    res.json({ ok: true, preferences });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Update preferences
+app.post("/notifications/preferences", (req, res) => {
+  try {
+    const result = updateNotificationPreferences(req.body);
+    audit("notification_preferences_updated", result.preferences);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Send test notification
+app.post("/notifications/test", async (req, res) => {
+  try {
+    const result = await sendTestNotification();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Notifications - Get available types
+app.get("/notifications/types", (req, res) => {
+  try {
+    const types = getNotificationTypes();
+    res.json({ ok: true, types });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 // Manual signal analysis (for automation)
 app.post("/automation/analyze", async (req, res) => {
   const { symbol = "BTCUSDT", interval = "1m" } = req.body || {};
@@ -251,6 +630,121 @@ app.post("/automation/analyze", async (req, res) => {
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: String(e) });
+  }
+});
+
+// Day Trading Simulation
+app.post("/simulation/day-trading", async (req, res) => {
+  const { capital = 100, symbol = "BTCUSD", interval = "1m" } = req.body || {};
+
+  try {
+    // Import simulator
+    const { simulateDayTrading, generateSimulationReport } = await import('./lib/day-trading-simulator.mjs');
+
+    // Fetch full day of 1-minute candles (1440 candles = 24 hours)
+    console.log(`📊 Fetching ${symbol} candles for day trading simulation...`);
+    const candles = await krakenCandles({ symbol, interval, limit: 1440 });
+
+    if (candles.length < 100) {
+      return res.status(400).json({
+        ok: false,
+        error: `Not enough candles for simulation (got ${candles.length}, need 100+)`
+      });
+    }
+
+    console.log(`✅ Fetched ${candles.length} candles`);
+    console.log(`💰 Simulating with $${capital} CAD starting capital...`);
+
+    // Run simulation
+    const results = simulateDayTrading(candles, capital, {
+      sizePct: 0.95,      // Use 95% of capital per trade
+      feePercent: 0.1,    // Kraken taker fees
+      slippagePercent: 0.05 // Realistic slippage
+    });
+
+    if (!results.ok) {
+      return res.status(400).json(results);
+    }
+
+    // Generate readable report
+    const report = generateSimulationReport(results);
+
+    console.log(`✅ Simulation complete: ${results.totalTrades} trades, ${results.winRate.toFixed(1)}% win rate`);
+
+    audit("day_trading_simulation", {
+      capital,
+      symbol,
+      totalTrades: results.totalTrades,
+      endingCapital: results.endingCapital,
+      totalPnl: results.totalPnl
+    });
+
+    res.json({
+      ok: true,
+      results,
+      report,
+      summary: {
+        startingCapital: results.startingCapital,
+        endingCapital: results.endingCapital,
+        totalPnl: results.totalPnl,
+        totalPnlPercent: results.totalPnlPercent,
+        totalTrades: results.totalTrades,
+        winRate: results.winRate,
+        profitable: results.totalPnl >= 0
+      }
+    });
+  } catch (e) {
+    console.error("Day trading simulation error:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Force Strategy Selection
+app.post("/strategy/force", async (req, res) => {
+  const { strategy } = req.body || {};
+
+  try {
+    const { setStrategy, enableAutoSwitch, STRATEGY_MANAGER_CONFIG } = await import('./lib/strategy-manager.mjs');
+
+    // If strategy is null or "auto", enable auto-switching
+    if (!strategy || strategy === "auto") {
+      const result = enableAutoSwitch();
+      audit("strategy_auto_enabled", {});
+      return res.json(result);
+    }
+
+    // Validate strategy
+    const allowedStrategies = STRATEGY_MANAGER_CONFIG.allowedStrategies;
+    if (!allowedStrategies.includes(strategy)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid strategy. Allowed: ${allowedStrategies.join(', ')}`
+      });
+    }
+
+    // Force strategy
+    const result = setStrategy(strategy);
+    audit("strategy_forced", { strategy });
+
+    console.log(`🎯 Strategy manually set to: ${strategy}`);
+    console.log(`   Auto-switching disabled`);
+
+    res.json(result);
+  } catch (e) {
+    console.error("Force strategy error:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// Get Strategy Status
+app.get("/strategy/status", async (req, res) => {
+  try {
+    const { getStrategyStatus } = await import('./lib/strategy-manager.mjs');
+    const status = getStrategyStatus();
+    res.json({ ok: true, ...status });
+  } catch (e) {
+    console.error("Strategy status error:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -343,12 +837,9 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Serve static frontend files from public/
-app.use(express.static('public'));
-
-// Catch-all route to serve index.html for client-side routing
-app.get('*', (req, res) => {
-  res.sendFile('public/index.html', { root: '.' });
+// SPA fallback: serve index.html for all unmatched routes
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 const port = process.env.PORT || 8888;
@@ -356,10 +847,14 @@ httpServer.listen(port, () => {
   console.log(`TrustTrade backend listening on :${port}`);
   console.log("WebSocket server ready at ws://localhost:" + port);
   console.log("Automation endpoints available:");
-  console.log("  POST   /automation/start     - Start automated trading");
-  console.log("  POST   /automation/stop      - Stop automated trading");
-  console.log("  GET    /automation/status    - Check automation status");
-  console.log("  POST   /automation/cdn-prices- Toggle CDN prices");
-  console.log("  GET    /portfolio            - View portfolio");
-  console.log("  GET    /trades               - View trade history");
+  console.log("  POST   /automation/start        - Start automated trading");
+  console.log("  POST   /automation/stop         - Stop automated trading");
+  console.log("  GET    /automation/status       - Check automation status");
+  console.log("  POST   /automation/cdn-prices   - Toggle CDN prices");
+  console.log("  GET    /portfolio               - View portfolio");
+  console.log("  GET    /trades                  - View trade history");
+  console.log("Strategy & Simulation endpoints:");
+  console.log("  POST   /strategy/force          - Force specific strategy");
+  console.log("  GET    /strategy/status         - Get current strategy");
+  console.log("  POST   /simulation/day-trading  - Simulate day trading with $100 CAD");
 });
