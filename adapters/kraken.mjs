@@ -43,12 +43,12 @@ export async function getCandles({ symbol = "BTCUSD", interval = "1m", limit = 5
     // Map Kraken OHLC format to standard format
     // Kraken format: [time, open, high, low, close, vwap, volume, count]
     return candles.map(c => ({
-      t: c[0] * 1000, // Convert to milliseconds
-      o: +c[1], // open
-      h: +c[2], // high
-      l: +c[3], // low
-      c: +c[4], // close
-      v: +c[6] // volume
+      time: c[0] * 1000, // Convert to milliseconds
+      open: +c[1],
+      high: +c[2],
+      low: +c[3],
+      close: +c[4],
+      volume: +c[6]
     }));
   } catch (e) {
     throw new Error(`Kraken getCandles failed: ${e.message}`);
