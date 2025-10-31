@@ -50,6 +50,7 @@ function App() {
   const [candles, setCandles] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [success, setSuccess] = useState(null)
   const [realtimeEnabled, setRealtimeEnabled] = useState(false)
   const [realtimeInterval, setRealtimeInterval] = useState(10000) // 10 seconds
   const [useWebSocket, setUseWebSocket] = useState(true) // Try WebSocket first
